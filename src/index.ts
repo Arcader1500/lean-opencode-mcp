@@ -59,11 +59,11 @@ export const opencodeDelegateSchema = z.object({
     .describe(
       "Existing OpenCode sessionId to continue a multi-turn conversation with the subagent."
     ),
-  attachUrl: z
+  serverUrl: z
     .string()
     .optional()
     .describe(
-      "Optional URL of a running opencode serve daemon (e.g. http://localhost:4096) to bypass cold-start."
+      "Optional URL of a running opencode server (--server) if overriding OpenCode's default background service."
     ),
   timeoutMs: z
     .number()
@@ -184,7 +184,7 @@ export async function handleOpenCodeDelegate(
     model: parsed.model,
     agent: parsed.agent,
     sessionId: parsed.sessionId,
-    attachUrl: parsed.attachUrl,
+    serverUrl: parsed.serverUrl,
     timeoutMs: parsed.timeoutMs,
   };
 

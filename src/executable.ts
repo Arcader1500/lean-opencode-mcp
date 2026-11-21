@@ -14,6 +14,12 @@ interface ModelStateFile {
 
 const DEFAULT_FALLBACK_MODEL = "opencode/deepseek-v4.1-flash-free";
 
+const FREE_DEFAULT_MODELS = [
+  "opencode/deepseek-v4.1-flash-free",
+  "opencode/minimax-m3.1-flash-free",
+  "opencode/mimo-v2.6-flash-free",
+];
+
 /**
  * Resolves the OpenCode CLI executable path.
  * On Windows, prefers a direct `.exe` path so `spawn` can run with `shell: false`,
@@ -105,4 +111,25 @@ export function detectDefaultModel(): string {
     return recent[0];
   }
   return process.env.OPENCODE_MODEL || DEFAULT_FALLBACK_MODEL;
+}
+
+/**
+ * Builds the ordered, deduplicated list of models to try when `primaryModel`
+ * fails for a retryable reason: recent models first, then favorites, then the
+ * standard free defaults. The primary model itself is excluded.
+ */
+export function getFallbackModels(primaryModel: string): string[] {
+  const { recent, favorite } = readRecentAndFavoriteModels();
+  const candidates = [...recent, ...favorite, ...FREE_DEFAULT_MODELS];
+
+  const seen = new Set<string>();
+  const fallbacks: string[] = [];
+  for (const candidate of candidates) {
+    if (candidate === primaryModel || seen.has(candidate)) {
+      continue;
+    }
+    seen.add(candidate);
+    fallbacks.push(candidate);
+  }
+  return fallbacks;
 }

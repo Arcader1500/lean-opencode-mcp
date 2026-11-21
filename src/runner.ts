@@ -1,5 +1,10 @@
 import { spawn } from "node:child_process";
-import { detectDefaultModel, resolveOpenCodeBinary } from "./executable.js";
+import {
+  detectDefaultModel,
+  getFallbackModels,
+  resolveOpenCodeBinary,
+} from "./executable.js";
+import { collectGitSummary, type GitChangeSummary } from "./gitSummary.js";
 
 export interface DelegateOptions {
   task: string;
@@ -8,32 +13,19 @@ export interface DelegateOptions {
   model?: string;
   agent?: "build" | "plan" | "explore";
   sessionId?: string;
-  attachUrl?: string;
+  serverUrl?: string;
   timeoutMs?: number;
-}
-
-export interface ToolUsageRecord {
-  tool: string;
-  status: string;
-  input?: Record<string, unknown>;
-}
-
-export interface TokenCounts {
-  input: number;
-  output: number;
-  reasoning: number;
 }
 
 export interface DelegateResult {
   status: "completed" | "failed";
   sessionId?: string;
   model: string;
-  cwd: string;
   response: string;
-  toolsUsed: ToolUsageRecord[];
-  tokens: TokenCounts;
+  toolCallCount: number;
   durationMs: number;
   error?: string;
+  gitSummary?: GitChangeSummary;
 }
 
 interface OpenCodeRawEvent {
@@ -62,37 +54,54 @@ interface OpenCodeRawEvent {
 
 const DEFAULT_TIMEOUT_MS = 300_000;
 
+const MAX_FAILOVER_ATTEMPTS = 2;
+
+const RETRYABLE_MODEL_ERROR_PATTERN =
+  /rate.?limit|429|quota|overloaded|unavailable|provider|model.*not.*found|502|503|504|capacity/i;
+
 /**
- * Runs a delegated OpenCode CLI task using `--format json` NDJSON streaming
- * and returns a structured result with accumulated text, tool usage, and tokens.
+ * Returns true when a failure looks like a provider/model availability problem
+ * that another model could plausibly solve (rate limits, quota, outages).
  */
-export function runOpenCodeTask(
+export function isRetryableModelError(errorMsg?: string): boolean {
+  if (!errorMsg) {
+    return false;
+  }
+  return RETRYABLE_MODEL_ERROR_PATTERN.test(errorMsg);
+}
+
+/**
+ * Runs a single OpenCode CLI attempt with `--format json` NDJSON streaming and
+ * returns a structured result with accumulated text, tool usage, and tokens.
+ */
+async function runSingleAttempt(
   options: DelegateOptions,
+  modelToUse: string,
+  effectiveCwd: string,
   onProgress?: (msg: string) => void
 ): Promise<DelegateResult> {
   const startTime = Date.now();
   const binary = resolveOpenCodeBinary();
-  const effectiveModel = options.model || detectDefaultModel();
   const effectiveAgent = options.agent || "build";
-  const effectiveCwd = options.cwd || process.cwd();
-  const effectiveAttachUrl = options.attachUrl || process.env.OPENCODE_ATTACH_URL;
+  const effectiveServerUrl = options.serverUrl || process.env.OPENCODE_SERVER_URL;
   const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
 
   const args: string[] = [
     "run",
     "-m",
-    effectiveModel,
+    modelToUse,
     "--format",
     "json",
     "--agent",
     effectiveAgent,
+    "--auto",
   ];
 
   if (options.sessionId) {
     args.push("--session", options.sessionId);
   }
-  if (effectiveAttachUrl) {
-    args.push("--attach", effectiveAttachUrl);
+  if (effectiveServerUrl) {
+    args.push("--server", effectiveServerUrl);
   }
   if (options.files && options.files.length > 0) {
     for (const file of options.files) {
@@ -107,15 +116,14 @@ export function runOpenCodeTask(
   return new Promise<DelegateResult>((resolve) => {
     let sessionId: string | undefined = options.sessionId;
     let response = "";
-    const toolsUsed: ToolUsageRecord[] = [];
-    const tokens: TokenCounts = { input: 0, output: 0, reasoning: 0 };
+    let toolCallCount = 0;
     let errorMessage: string | undefined;
     let stderrOutput = "";
     let stdoutBuffer = "";
     let settled = false;
     let timer: NodeJS.Timeout | undefined;
 
-    const finish = (overrideError?: string) => {
+    const finish = async (overrideError?: string) => {
       if (settled) {
         return;
       }
@@ -125,15 +133,16 @@ export function runOpenCodeTask(
       }
 
       const finalError = overrideError ?? errorMessage;
+      const durationMs = Date.now() - startTime;
+      const gitSummary = await collectGitSummary(effectiveCwd);
       const result: DelegateResult = {
         status: finalError ? "failed" : "completed",
         sessionId,
-        model: effectiveModel,
-        cwd: effectiveCwd,
+        model: modelToUse,
         response,
-        toolsUsed,
-        tokens,
-        durationMs: Date.now() - startTime,
+        toolCallCount,
+        durationMs,
+        ...(gitSummary ? { gitSummary } : {}),
       };
       if (finalError) {
         result.error = finalError;
@@ -184,34 +193,13 @@ export function runOpenCodeTask(
             typeof event.part?.state?.status === "string"
               ? event.part.state.status
               : "unknown";
-          const rawInput = event.part?.state?.input;
-          const input =
-            rawInput && typeof rawInput === "object" && !Array.isArray(rawInput)
-              ? (rawInput as Record<string, unknown>)
-              : undefined;
-
-          toolsUsed.push(
-            input ? { tool: toolName, status: toolStatus, input } : { tool: toolName, status: toolStatus }
-          );
+          toolCallCount += 1;
           onProgress?.(`[tool] ${toolName} (${toolStatus})`);
           break;
         }
 
-        case "step_finish": {
-          const stepTokens = event.part?.tokens;
-          if (stepTokens && typeof stepTokens === "object") {
-            if (typeof stepTokens.input === "number") {
-              tokens.input += stepTokens.input;
-            }
-            if (typeof stepTokens.output === "number") {
-              tokens.output += stepTokens.output;
-            }
-            if (typeof stepTokens.reasoning === "number") {
-              tokens.reasoning += stepTokens.reasoning;
-            }
-          }
+        case "step_finish":
           break;
-        }
 
         case "error": {
           const msg =
@@ -244,7 +232,7 @@ export function runOpenCodeTask(
         } catch {
           // Ignore kill errors if process already exited
         }
-        finish(timeoutErr);
+        void finish(timeoutErr);
       }, timeoutMs);
     }
 
@@ -264,7 +252,7 @@ export function runOpenCodeTask(
     });
 
     child.on("error", (err) => {
-      finish(`Failed to spawn OpenCode (${binary}): ${err.message}`);
+      void finish(`Failed to spawn OpenCode (${binary}): ${err.message}`);
     });
 
     child.on("close", (code, signal) => {
@@ -274,7 +262,7 @@ export function runOpenCodeTask(
       }
 
       if (errorMessage) {
-        finish(errorMessage);
+        void finish(errorMessage);
         return;
       }
 
@@ -284,11 +272,46 @@ export function runOpenCodeTask(
           code !== null
             ? `OpenCode exited with code ${code}`
             : `OpenCode terminated by signal ${signal ?? "unknown"}`;
-        finish(detail ? `${reason}: ${detail}` : reason);
+        void finish(detail ? `${reason}: ${detail}` : reason);
         return;
       }
 
-      finish();
+      void finish();
     });
   });
+}
+
+/**
+ * Runs a delegated OpenCode CLI task, rotating to fallback models when a fresh
+ * session fails for a retryable model/provider reason before any tool ran.
+ */
+export async function runOpenCodeTask(
+  options: DelegateOptions,
+  onProgress?: (msg: string) => void
+): Promise<DelegateResult> {
+  const effectiveCwd = options.cwd || process.cwd();
+  const primaryModel = options.model || detectDefaultModel();
+
+  let result = await runSingleAttempt(options, primaryModel, effectiveCwd, onProgress);
+  if (options.sessionId || result.status !== "failed") {
+    return result;
+  }
+
+  const fallbacks = isRetryableModelError(result.error)
+    ? getFallbackModels(primaryModel).slice(0, MAX_FAILOVER_ATTEMPTS)
+    : [];
+
+  let prevModel = primaryModel;
+  for (const nextModel of fallbacks) {
+    if (result.toolCallCount > 0 || !isRetryableModelError(result.error)) {
+      break;
+    }
+    onProgress?.(
+      `[failover] ${prevModel} failed (${result.error}), retrying with ${nextModel}...`
+    );
+    result = await runSingleAttempt(options, nextModel, effectiveCwd, onProgress);
+    prevModel = nextModel;
+  }
+
+  return result;
 }
